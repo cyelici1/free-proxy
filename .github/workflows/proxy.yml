@@ -1,0 +1,46 @@
+name: Free Proxy with Ngrok (SOCKS5)
+
+on:
+  workflow_dispatch:
+
+jobs:
+  proxy:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Install microsocks and jq
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y microsocks jq curl unzip
+
+      - name: Start microsocks proxy
+        run: |
+          nohup microsocks -p 1080 -i 0.0.0.0 &
+          echo "Microsocks started on port 1080"
+
+      - name: Install ngrok
+        run: |
+          curl -sSL "https://bin.equinox.io/c/bNyj1mQVY4c/ngrok-stable-linux-amd64.zip" -o ngrok.zip
+          unzip ngrok.zip
+          sudo mv ngrok /usr/local/bin/
+          ngrok version
+
+      - name: Start ngrok tunnel
+        env:
+          NGROK_AUTHTOKEN: ${{ secrets.NGROK_AUTHTOKEN }}
+        run: |
+          ngrok authtoken "$NGROK_AUTHTOKEN"
+          nohup ngrok tcp 1080 --log=stdout > ngrok.log 2>&1 &
+          sleep 5
+          echo "Ngrok tunnel created. Fetching public URL..."
+          curl -s http://127.0.0.1:4040/api/tunnels > tunnels.json || true
+          cat tunnels.json || true
+          URL=$(jq -r '.tunnels[0].public_url // empty' tunnels.json)
+          echo "SOCKS5 Proxy Address: $URL"
+          echo "============================"
+          echo "Copy the address above (e.g. tcp://0.tcp.ngrok.io:xxxxx)"
+          echo "============================"
+
+      - name: Keep alive
+        run: |
+          echo "Proxy is active for 6 hours."
+          sleep 21600
