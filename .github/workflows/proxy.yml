@@ -1,46 +1,138 @@
-name: Free Proxy with Ngrok (SOCKS5)
+name: SOCKS5 via ngrok (Full, robust)
 
 on:
   workflow_dispatch:
 
+env:
+  SOCKS_PORT: 1080
+  KEEP_ALIVE_SECONDS: 21600   # 6 hours (تغییر بدی)
+  NGROK_LOCAL_API: "http://127.0.0.1:4040"
+
 jobs:
-  proxy:
+  socks-ngrok:
     runs-on: ubuntu-latest
     steps:
-      - name: Install microsocks and jq
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y microsocks jq curl unzip
+      - name: Checkout (not strictly needed)
+        uses: actions/checkout@v4
 
-      - name: Start microsocks proxy
+      - name: Prepare system (install deps)
         run: |
-          nohup microsocks -p 1080 -i 0.0.0.0 &
-          echo "Microsocks started on port 1080"
+          sudo apt-get update -y
+          sudo apt-get install -y curl jq unzip build-essential git netcat-openbsd
 
-      - name: Install ngrok
+      - name: Install or build microsocks
         run: |
-          curl -sSL "https://bin.equinox.io/c/bNyj1mQVY4c/ngrok-stable-linux-amd64.zip" -o ngrok.zip
-          unzip ngrok.zip
-          sudo mv ngrok /usr/local/bin/
-          ngrok version
+          if command -v microsocks >/dev/null 2>&1; then
+            echo "microsocks already installed"
+          else
+            sudo apt-get install -y microsocks || true
+            if ! command -v microsocks >/dev/null 2>&1; then
+              echo "Building microsocks from source..."
+              git clone https://github.com/rofl0r/microsocks.git /tmp/microsocks
+              cd /tmp/microsocks
+              make
+              sudo install -m 755 microsocks /usr/local/bin/microsocks
+            fi
+          fi
+          echo "microsocks version (if available):"
+          microsocks -h || true
 
-      - name: Start ngrok tunnel
+      - name: Start microsocks (SOCKS5) in background
+        run: |
+          echo "Starting microsocks on port ${SOCKS_PORT} (no auth)"
+          nohup microsocks -p "${SOCKS_PORT}" -i 0.0.0.0 > /tmp/microsocks.log 2>&1 & echo $! > /tmp/microsocks.pid
+          # wait and check listening
+          sleep 1
+          ss -ltnp | grep "${SOCKS_PORT}" || true
+          echo "microsocks log (tail):"
+          tail -n 50 /tmp/microsocks.log || true
+
+      - name: Install ngrok (stable)
+        run: |
+          echo "Downloading ngrok..."
+          NGROK_ZIP=/tmp/ngrok.zip
+          curl -sSL "https://bin.equinox.io/c/bNyj1mQVY4c/ngrok-stable-linux-amd64.zip" -o $NGROK_ZIP
+          unzip -o $NGROK_ZIP -d /tmp
+          sudo mv /tmp/ngrok /usr/local/bin/ngrok
+          ngrok version || true
+
+      - name: Start ngrok TCP tunnel and fetch public URL
+        id: ngrok_start
         env:
           NGROK_AUTHTOKEN: ${{ secrets.NGROK_AUTHTOKEN }}
+          SOCKS_PORT: ${{ env.SOCKS_PORT }}
+          NGROK_LOCAL_API: ${{ env.NGROK_LOCAL_API }}
         run: |
-          ngrok authtoken "$NGROK_AUTHTOKEN"
-          nohup ngrok tcp 1080 --log=stdout > ngrok.log 2>&1 &
-          sleep 5
-          echo "Ngrok tunnel created. Fetching public URL..."
-          curl -s http://127.0.0.1:4040/api/tunnels > tunnels.json || true
-          cat tunnels.json || true
-          URL=$(jq -r '.tunnels[0].public_url // empty' tunnels.json)
-          echo "SOCKS5 Proxy Address: $URL"
-          echo "============================"
-          echo "Copy the address above (e.g. tcp://0.tcp.ngrok.io:xxxxx)"
-          echo "============================"
+          if [ -z "$NGROK_AUTHTOKEN" ]; then
+            echo "ERROR: NGROK_AUTHTOKEN secret not set. Add it in Repo Settings -> Secrets."
+            exit 1
+          fi
 
-      - name: Keep alive
+          # Authenticate
+          ngrok authtoken "$NGROK_AUTHTOKEN" || true
+
+          # Start ngrok (TCP to local SOCKS port)
+          echo "Starting ngrok tcp ${SOCKS_PORT} ..."
+          nohup ngrok tcp ${SOCKS_PORT} --log=stdout > /tmp/ngrok.log 2>&1 & echo $! > /tmp/ngrok.pid
+
+          # Wait & retry to fetch public_url
+          MAX_RETRIES=30
+          for i in $(seq 1 $MAX_RETRIES); do
+            sleep 1
+            if curl -s ${NGROK_LOCAL_API}/api/tunnels > /tmp/tunnels.json 2>/dev/null; then
+              PUB=$(jq -r '.tunnels[0].public_url // empty' /tmp/tunnels.json || true)
+              # sometimes tunnels[] may be empty for a bit
+              if [ -n "$PUB" ]; then
+                echo "Found public_url: $PUB"
+                echo "NGROK_PUBLIC_URL=$PUB" >> $GITHUB_OUTPUT
+                # also export host and port separately if tcp
+                if echo "$PUB" | grep -qi '^tcp://'; then
+                  HOST_PORT=$(echo "$PUB" | sed -E 's#^tcp://##')
+                  HOST=$(echo "$HOST_PORT" | cut -d: -f1)
+                  PORT=$(echo "$HOST_PORT" | cut -d: -f2)
+                  echo "NGROK_PUBLIC_HOST=$HOST" >> $GITHUB_OUTPUT
+                  echo "NGROK_PUBLIC_PORT=$PORT" >> $GITHUB_OUTPUT
+                fi
+                break
+              fi
+            fi
+            echo "ngrok public url not ready yet (attempt $i/$MAX_RETRIES)..."
+          done
+
+          # If not found, print debugging info and exit non-zero
+          if [ -z "${{ steps.ngrok_start.outputs.NGROK_PUBLIC_URL }}" ] && [ ! -s /tmp/tunnels.json ]; then
+            echo "Could not fetch ngrok tunnels via local API. Showing ngrok.log:"
+            tail -n 200 /tmp/ngrok.log || true
+            cat /tmp/tunnels.json || true
+            # still attempt to parse public_url directly from log as fallback
+            grep -Eo 'tcp://[^ ]+' /tmp/ngrok.log | head -n1 || true
+            # don't fail the job here; print message and continue so user can inspect logs
+            echo "WARNING: ngrok public URL not found. Check /tmp/ngrok.log artifact."
+          fi
+
+          echo "Done ngrok start step."
+
+      - name: Show parsed public info (for user)
         run: |
-          echo "Proxy is active for 6 hours."
-          sleep 21600
+          echo "---- ngrok public info (from outputs) ----"
+          echo "Public URL: ${{ steps.ngrok_start.outputs.NGROK_PUBLIC_URL || '' }}"
+          echo "Host: ${{ steps.ngrok_start.outputs.NGROK_PUBLIC_HOST || '' }}"
+          echo "Port: ${{ steps.ngrok_start.outputs.NGROK_PUBLIC_PORT || '' }}"
+          echo ""
+          echo "If Public URL is empty, check the uploaded logs artifact."
+
+      - name: Upload logs (artifact) for debugging
+        uses: actions/upload-artifact@v4
+        with:
+          name: ngrok-microsocks-logs
+          path: |
+            /tmp/ngrok.log
+            /tmp/microsocks.log
+            /tmp/tunnels.json
+            /tmp/ngrok.pid
+            /tmp/microsocks.pid
+
+      - name: Keep job alive for testing (CANCEL when done)
+        run: |
+          echo "Proxy up. Job will sleep for ${KEEP_ALIVE_SECONDS} seconds (cancel workflow when finished)."
+          sleep ${KEEP_ALIVE_SECONDS}
